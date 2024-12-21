@@ -1,23 +1,100 @@
-// Copyright 2024 Muradov Kamal
-#include "mpi/muradov_k_trapezoid_method/include/ops_mpi.hpp"
-#include <boost/mpi/collectives.hpp>
-#include <boost/mpi/communicator.hpp>
-#include <cmath>
+#include "mpi/muradov_k_trapezoidal_method/include/ops_mpi.hpp"
 
-double trapezoidal_method(double (*func)(double), double a, double b, int n) {
-    boost::mpi::communicator world;
-    double h = (b - a) / n;
-    double local_a = a + world.rank() * h * (n / world.size());
-    double local_b = local_a + h * (n / world.size());
-    double local_integral = 0.0;
+#include <algorithm>
+#include <boost/mpi.hpp>
+#include <functional>
+#include <vector>
 
-    for (int i = 0; i < n / world.size(); ++i) {
-        local_integral += (func(local_a) + func(local_a + h)) * h / 2;
-        local_a += h;
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::pre_processing() {
+    a_ = *reinterpret_cast<double*>(taskData->inputs[0]);
+    b_ = *reinterpret_cast<double*>(taskData->inputs[1]);
+    n_ = *reinterpret_cast<int*>(taskData->inputs[2]);
+    return true;
+}
+
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::validation() {
+    return taskData->outputs_count[0] == 1;
+}
+
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::run() {
+    res_ = integrate_function(a_, b_, n_, function_);
+    return true;
+}
+
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::post_processing() {
+    *reinterpret_cast<double*>(taskData->outputs[0]) = res_;
+    return true;
+}
+
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::pre_processing() {
+    if (world.rank() == 0) {
+        a_ = *reinterpret_cast<double*>(taskData->inputs[0]);
+        b_ = *reinterpret_cast<double*>(taskData->inputs[1]);
+        n_ = *reinterpret_cast<int*>(taskData->inputs[2]);
     }
+    return true;
+}
 
-    double total_integral;
-    reduce(world, local_integral, total_integral, std::plus<double>(), 0);
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::validation() {
+    if (world.rank() == 0) {
+        return taskData->outputs_count[0] == 1;
+    }
+    return true;
+}
 
-    return total_integral;
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::run() {
+    double params[3] = {0.0};
+    if (world.rank() == 0) {
+        params[0] = a_;
+        params[1] = b_;
+        params[2] = static_cast<double>(n_);
+    }
+    boost::mpi::broadcast(world, params, std::size(params), 0);
+    double local_res = integrate_function(params[0], params[1], static_cast<int>(params[2]), function_);
+    boost::mpi::reduce(world, local_res, res_, std::plus(), 0);
+    return true;
+}
+
+bool muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::post_processing() {
+    if (world.rank() == 0) {
+        *reinterpret_cast<double*>(taskData->outputs[0]) = res_;
+    }
+    return true;
+}
+
+void muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::set_function(
+    const std::function<double(double)>& f) {
+    function_ = f;
+}
+
+void muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::set_function(
+    const std::function<double(double)>& f) {
+    function_ = f;
+}
+
+double muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralSequential::integrate_function(
+    double a, double b, int n, const std::function<double(double)>& f) {
+    const double width = (b - a) / n;
+    double result = 0.0;
+    for (int step = 0; step < n; step++) {
+        const double x1 = a + step * width;
+        const double x2 = a + (step + 1) * width;
+        result += 0.5 * (x2 - x1) * (f(x1) + f(x2));
+    }
+    return result;
+}
+
+double muradov_k_trapezoidal_method_mpi::TrapezoidalIntegralParallel::integrate_function(
+    double a, double b, int n, const std::function<double(double)>& f) {
+    int rank = world.rank();
+    int size = world.size();
+
+    const double width = (b - a) / n;
+    double result = 0.0;
+    for (int step = rank; step < n; step += size) {
+        const double x1 = a + step * width;
+        const double x2 = a + (step + 1) * width;
+        result += 0.5 * (x2 - x1) * (f(x1) + f(x2));
+    }
+    return result;
 }
